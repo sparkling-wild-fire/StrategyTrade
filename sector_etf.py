@@ -4,7 +4,8 @@ from sector import JQ_L1_TO_SECTOR
 
 # 主升判定阈值
 _MAIN_RALLY_RETURN = 0.06   # 20日涨幅>6%
-_MAIN_RALLY_VOL_RATIO = 1.1  # 近5日均量 > 近20日均量*1.1
+_MAIN_RALLY_VOL_RATIO = 1.0  # 近5日均量 ≥ 近20日均量
+_MAIN_RALLY_BULLISH = True   # 必须均线多头排列
 
 # 缓存
 _etf_df_cache = None
@@ -37,13 +38,23 @@ def _calc_etf_strength_from_hist(hist_df):
     ma20 = close.rolling(20).mean().iloc[-1]
     bullish_align = ma5 > ma10 > ma20
 
-    is_main_rally = ret_20 > _MAIN_RALLY_RETURN and vol_ratio > _MAIN_RALLY_VOL_RATIO
+    is_main_rally = (ret_20 > _MAIN_RALLY_RETURN
+                     and vol_ratio > _MAIN_RALLY_VOL_RATIO
+                     and bullish_align)
+
+    # 主升衰竭判定：均线还多头但量能萎缩或近5日涨幅放缓
+    is_fading = False
+    if bullish_align and ret_20 > _MAIN_RALLY_RETURN:
+        ret_5 = (close.iloc[-1] - close.iloc[-5]) / close.iloc[-5] if len(close) >= 5 else 0
+        if vol_ratio < 0.9 or ret_5 < ret_20 * 0.2:
+            is_fading = True
 
     return {
         'return_20': ret_20,
         'vol_ratio': vol_ratio,
         'bullish_align': bullish_align,
         'is_main_rally': is_main_rally,
+        'is_fading': is_fading,
     }
 
 
@@ -53,9 +64,11 @@ def _classify_level(strength):
         return 'weak'
     if strength['is_main_rally']:
         return 'main'
+    if strength.get('is_fading'):
+        return 'main_fading'
     if strength['return_20'] > 0.02 and strength['bullish_align']:
         return 'rotating'
-    if strength['return_20'] > 0:
+    if strength['return_20'] > 0.03:
         return 'rotating'
     return 'weak'
 
@@ -181,11 +194,11 @@ def load_etf_hist_map():
 
 def _print_sector_strength(strength_map):
     """打印板块强度"""
-    level_names = {'main': '主升', 'rotating': '轮动', 'weak': '弱势'}
+    level_names = {'main': '主升', 'main_fading': '主升尾声', 'rotating': '轮动', 'weak': '弱势'}
     print("\n[板块ETF强度]")
     sorted_sectors = sorted(strength_map.items(), key=lambda x: x[1].get('return_20', 0), reverse=True)
     for sector, info in sorted_sectors:
         level = info.get('level', 'weak')
         ret = info.get('return_20', 0)
-        flag = ' <<<' if level == 'main' else ''
+        flag = ' <<<' if level in ('main', 'main_fading') else ''
         print(f"  {sector}: {level_names[level]} 20日{ret:.1%}{flag}")

@@ -70,7 +70,7 @@ def _run_analysis(max_count=0):
         _task_status["last_start"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     try:
-        cmd = [sys.executable, os.path.join(PROJECT_DIR, "main.py")]
+        cmd = [sys.executable, os.path.join(PROJECT_DIR, "main_buy_singal.py")]
         if max_count > 0:
             # 需要main.py支持--max-count参数，目前不支持，先跳过
             pass

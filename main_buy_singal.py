@@ -1,4 +1,4 @@
-# main.py
+# main_buy_singal.py
 import os
 os.environ['TQDM_DISABLE'] = '1'
 
@@ -10,7 +10,7 @@ import datetime
 import json
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from market import get_stock_list, fetch_stock_hist, prefetch_hist_batch, fetch_spot_data, filter_a_stocks, get_etf_list
+from market import get_stock_list, fetch_stock_hist, prefetch_hist_batch, fetch_spot_data, filter_a_stocks, get_etf_list, load_hist_batch
 from factors import calculate_all
 from strategies import score_stock
 from sector import get_sector_map, classify
@@ -40,6 +40,8 @@ def _is_etf_code(code):
 def _hold_suggestion(level):
     if level == 'main':
         return '1~2月'
+    elif level == 'main_fading':
+        return '2~4周'
     elif level == 'rotating':
         return '2~4周'
     else:
@@ -48,12 +50,17 @@ def _hold_suggestion(level):
 
 def _position_map(level, total):
     if level == 'main':
-        if total >= 5:
+        if total >= 6:
             return '60%'
         elif total >= 2:
             return '30%'
+    elif level == 'main_fading':
+        if total >= 6:
+            return '40%'
+        elif total >= 2:
+            return '20%'
     else:
-        if total >= 5:
+        if total >= 6:
             return '50%'
         elif total >= 2:
             return '20%'
@@ -96,6 +103,18 @@ def _append_csv(path, row, written_flag_name):
         writer.writerow([str(row.get(k, '')) for k in _CSV_FIELDS])
 
 
+def _sort_csv_by_score(path):
+    """按综合得分从高到低重排CSV文件"""
+    if not os.path.exists(path):
+        return
+    df = pd.read_csv(path, encoding='utf-8-sig', dtype={'代码': str})
+    if df.empty or '综合得分' not in df.columns:
+        return
+    df['代码'] = df['代码'].str.zfill(6)
+    df.sort_values('综合得分', ascending=False, inplace=True)
+    df.to_csv(path, index=False, encoding='utf-8-sig')
+
+
 def _compute_sector_info(df_with_indicators_list, sector_map):
     """预计算各板块20日平均涨幅、上涨占比、成交量趋势"""
     sector_data = {}
@@ -136,20 +155,23 @@ def _compute_sector_info(df_with_indicators_list, sector_map):
     return sector_info
 
 
-def analyze_one(code, name, spot_data=None, sector_avg_return=None, sector_up_ratio=None, sector_vol_trend=None, sector_level=None):
+def analyze_one(code, name, spot_data=None, sector_avg_return=None, sector_up_ratio=None, sector_vol_trend=None, sector_level=None, precomputed_indicators=None):
     """分析单只股票/ETF，返回评分结果或None"""
     try:
-        hist_df = fetch_stock_hist(code)
-        if hist_df is None or hist_df.empty:
-            return None
+        if precomputed_indicators is not None:
+            df_with_indicators = precomputed_indicators
+        else:
+            hist_df = fetch_stock_hist(code)
+            if hist_df is None or hist_df.empty:
+                return None
 
-        if spot_data and code in spot_data:
-            today_bar = spot_data[code]
-            today = today_bar['日期']
-            if str(hist_df['日期'].iloc[-1]) < today:
-                hist_df = pd.concat([hist_df, pd.DataFrame([today_bar])], ignore_index=True)
+            if spot_data and code in spot_data:
+                today_bar = spot_data[code]
+                today = today_bar['日期']
+                if str(hist_df['日期'].iloc[-1]) < today:
+                    hist_df = pd.concat([hist_df, pd.DataFrame([today_bar])], ignore_index=True)
 
-        df_with_indicators = calculate_all(hist_df)
+            df_with_indicators = calculate_all(hist_df)
         if df_with_indicators is None:
             return None
 
@@ -199,24 +221,36 @@ def _run_batch(code_name_list, label, check_sale=False, spot_data=None, buy_thre
 
     # 预加载历史数据并计算指标，用于板块平均涨幅
     hist_cache = {}
+    print(f"  [{label}] 批量加载历史数据...")
+    codes_to_load = [c for c, _ in code_name_list]
+    batch_hist = load_hist_batch(codes_to_load)
+    print(f"  [{label}] 加载完成 {len(batch_hist)}/{total} 只，计算指标...")
+
+    loaded = 0
     for code, name in code_name_list:
         try:
-            hist_df = fetch_stock_hist(code)
-            if hist_df is not None and not hist_df.empty:
-                if spot_data and code in spot_data:
-                    today_bar = spot_data[code]
-                    today = today_bar['日期']
-                    if str(hist_df['日期'].iloc[-1]) < today:
-                        hist_df = pd.concat([hist_df, pd.DataFrame([today_bar])], ignore_index=True)
-                df_ind = calculate_all(hist_df)
-                if df_ind is not None:
-                    hist_cache[code] = df_ind
+            hist_df = batch_hist.get(code)
+            if hist_df is None:
+                continue
+            if spot_data and code in spot_data:
+                today_bar = spot_data[code]
+                today = today_bar['日期']
+                if str(hist_df['日期'].iloc[-1]) < today:
+                    hist_df = pd.concat([hist_df, pd.DataFrame([today_bar])], ignore_index=True)
+            df_ind = calculate_all(hist_df)
+            if df_ind is not None:
+                hist_cache[code] = df_ind
         except Exception:
             pass
+        loaded += 1
+        if loaded % 500 == 0 or loaded == total:
+            print(f"\r  [{label}] 指标计算进度 {loaded}/{total}", end='', flush=True)
+    print()
 
     sector_avg = _compute_sector_info(list(hist_cache.items()), _sector_map)
 
     # 用板块ETF判断当前主升板块
+    print(f"  [{label}] 获取板块ETF强度...")
     etf_sector_strength = get_sector_strength()
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
@@ -227,9 +261,10 @@ def _run_batch(code_name_list, label, check_sale=False, spot_data=None, buy_thre
             # 优先用ETF板块强度
             etf_info = etf_sector_strength.get(sector, {})
             sector_level = etf_info.get('level')
+            precomputed = hist_cache.get(code)
             f = pool.submit(analyze_one, code, name, spot_data,
                             info.get('avg_return'), info.get('up_ratio'), info.get('vol_trend'),
-                            sector_level)
+                            sector_level, precomputed)
             futures[f] = (code, name)
 
         for f in as_completed(futures):
@@ -262,7 +297,7 @@ def _run_batch(code_name_list, label, check_sale=False, spot_data=None, buy_thre
                 '趋势得分': result['trend_score'],
                 '相对强度得分': result.get('rs_score', 0),
                 '板块类型': result.get('sector_type', ''),
-                '是否主升': '是' if result.get('sector_type') == 'main' else '',
+                '是否主升': '是' if result.get('sector_type') in ('main', 'main_fading') else '',
                 '评级': result['rating'],
                 '建议仓位': result.get('position', '0%'),
                 '建议持有': result.get('hold_suggestion', ''),
@@ -292,12 +327,7 @@ def _run_batch(code_name_list, label, check_sale=False, spot_data=None, buy_thre
                 buy_found = len(_buy_results)
                 sale_found = len(_sale_results)
 
-            if is_buy:
-                print(f"  [BUY] [{label} {done}/{total}] {code} {name} [{result['板块']}] 得分{result['total']} {result['rating']} 仓位{result.get('position','0%')} | 买入{buy_found}只")
-            elif is_sale:
-                print(f"  [SALE] [{label} {done}/{total}] {code} {name} [{result['板块']}] 得分{result['total']} {result['rating']} | 危出{sale_found}只")
-            else:
-                print(f"\r  [{label} {done}/{total}] 买入{buy_found} 危出{sale_found}          ", end='', flush=True)
+            print(f"\r  [{label} {done}/{total}] 买入{buy_found} 危出{sale_found}          ", end='', flush=True)
 
     return buy_count, sale_count
 
@@ -409,6 +439,11 @@ def main(sale_codes=None, max_count=0):
 
     calculate_sell_signals(sale_codes, all_codes, spot_data=spot_data)
 
+    # ======== 按得分排序CSV ========
+
+    _sort_csv_by_score(BUY_CSV)
+    _sort_csv_by_score(BUY_ETF_CSV)
+
     # ======== 结果汇总 ========
 
     with _lock:
@@ -427,32 +462,6 @@ def main(sale_codes=None, max_count=0):
     print(f"  买入信号(ETF)  -> {BUY_ETF_CSV}")
     if sale_codes:
         print(f"  危出信号 -> {SALE_CSV}")
-
-    if _buy_results:
-        print("\n[买入信号TOP]:")
-        buy_out = pd.DataFrame([{
-            '代码': r['代码'], '名称': r['名称'],
-            '板块': r['板块'],
-            '收盘价': r['收盘价'], '综合得分': r['total'],
-            'MACD': r['macd_score'], 'KDJ': r['kdj_score'], 'BB': r['bb_score'],
-            '量价': r['vol_score'], '追涨': r['chase_score'],
-            'RS': r.get('rs_score', 0), '仓位': r.get('position', '0%'),
-            '评级': r['rating'], '明细': '; '.join(r['details']),
-        } for r in sorted(_buy_results, key=lambda x: x['total'], reverse=True)])
-        print(buy_out.to_string(index=False))
-
-    if _sale_results:
-        print("\n[危出信号TOP]:")
-        sale_out = pd.DataFrame([{
-            '代码': r['代码'], '名称': r['名称'],
-            '板块': r['板块'],
-            '收盘价': r['收盘价'], '综合得分': r['total'],
-            'MACD': r['macd_score'], 'KDJ': r['kdj_score'], 'BB': r['bb_score'],
-            '量价': r['vol_score'], '追涨': r['chase_score'],
-            'RS': r.get('rs_score', 0), '仓位': r.get('position', '0%'),
-            '评级': r['rating'], '明细': '; '.join(r['details']),
-        } for r in sorted(_sale_results, key=lambda x: x['total'])])
-        print(sale_out.to_string(index=False))
 
     _notify_success(buy_found, sale_found, elapsed, sale_codes, effective_buy_threshold)
 

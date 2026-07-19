@@ -61,12 +61,15 @@ def score(df, sector_avg_return=None, sector_up_ratio=None, sector_vol_trend=Non
         kdj_shielded = True
 
     # 板块强度仅用于调整追涨因子权重，不单独作为评分因子
+    # 主升持续中 → 适度放大；主升尾声 → 不放大；轮动 → 适度放大；弱势 → 大幅打折
     if sector_level == 'main':
-        momentum_factor = 1.5
-    elif sector_level == 'weak':
-        momentum_factor = 0.5
-    else:
+        momentum_factor = 1.2
+    elif sector_level == 'main_fading':
         momentum_factor = 1.0
+    elif sector_level == 'weak':
+        momentum_factor = 0.3
+    else:
+        momentum_factor = 1.2
 
     # 均线趋势过滤
     ma5 = df['MA5'].iloc[-1]
@@ -99,8 +102,50 @@ def score(df, sector_avg_return=None, sector_up_ratio=None, sector_vol_trend=Non
         weighted[key] = int(val * w)
 
     total = sum(weighted.values())
+
+    # 追高惩罚：按板块强度区分（主升板块追高有效，弱势板块追高风险大）
+    close = df['收盘'].iloc[-1]
+    ma20 = df['MA20'].iloc[-1]
+    if ma20 > 0:
+        deviation = (close - ma20) / ma20
+        if sector_level == 'main':
+            # 主升板块：追高是趋势确认，不惩罚
+            all_details_extra = []
+        elif sector_level == 'main_fading':
+            # 主升尾声：轻微惩罚
+            if deviation > 0.10:
+                total -= 1
+                all_details_extra = ['⚠偏离均线-1']
+            else:
+                all_details_extra = []
+        elif sector_level == 'weak':
+            # 弱势板块：严格限制追高
+            if deviation > 0.10:
+                total -= 2
+                all_details_extra = ['⚠弱势追高-2']
+            elif deviation > 0.06:
+                total -= 1
+                all_details_extra = ['⚠弱势偏离-1']
+            else:
+                all_details_extra = []
+        else:
+            # 轮动板块：适度限制
+            if deviation > 0.06:
+                total -= 1
+                all_details_extra = ['⚠轮动偏离-1']
+            else:
+                all_details_extra = []
+    else:
+        all_details_extra = []
+
+    # 买入质量校验：趋势或动量至少有一项为正，且负因子不超过2个
+    has_trend = weighted['trend'] > 0 or bullish_align
+    has_momentum = weighted['macd'] > 0
+    neg_count = sum(1 for v in weighted.values() if v < 0)
+    quality_ok = (has_trend or has_momentum) and neg_count <= 2
+
     all_details = (macd_details + kdj_details + bb_details + vol_details
-                   + chase_details + trend_details + rs_details)
+                   + chase_details + trend_details + rs_details + all_details_extra)
     if kdj_shielded:
         all_details.append('⚠震荡市:KDJ屏蔽')
     if bearish_align:
@@ -108,30 +153,42 @@ def score(df, sector_avg_return=None, sector_up_ratio=None, sector_vol_trend=Non
     elif bullish_align:
         all_details.append('✅多头排列:买入项×1.2')
     if sector_level == 'main':
-        all_details.append('🔥主升板块:追涨×1.5')
+        all_details.append('🔥主升板块:追涨×1.2')
+    elif sector_level == 'main_fading':
+        all_details.append('⚠主升尾声:追涨×1.0')
     elif sector_level == 'weak':
-        all_details.append('🔻弱势板块:追涨×0.5')
+        all_details.append('🔻弱势板块:追涨×0.3')
 
-    # 综合评级
-    if total >= 5:
+    # 综合评级（买入质量不达标时降档）
+    if total >= 6 and quality_ok:
         rating = '强力买入'
+    elif total >= 6 and not quality_ok:
+        rating = '观望/试仓'
+        all_details.append('⚠质量不足:降为观望')
     elif total >= 2:
         rating = '观望/试仓'
-    elif total <= -4:
+    elif total <= -5 and sector_level not in ('rotating', 'main', 'main_fading'):
         rating = '坚决卖出'
     else:
         rating = '中性'
 
-    # 仓位映射（主升板块可加仓）
+    # 仓位映射
     if sector_level == 'main':
-        if total >= 5:
+        if total >= 6:
             position = '60%'
         elif total >= 2:
             position = '30%'
         else:
             position = '0%'
+    elif sector_level == 'main_fading':
+        if total >= 6:
+            position = '40%'
+        elif total >= 2:
+            position = '20%'
+        else:
+            position = '0%'
     else:
-        if total >= 5:
+        if total >= 6:
             position = '50%'
         elif total >= 2:
             position = '20%'
@@ -141,6 +198,8 @@ def score(df, sector_avg_return=None, sector_up_ratio=None, sector_vol_trend=Non
     # 持有期建议
     if sector_level == 'main':
         hold_suggestion = '1~2月'
+    elif sector_level == 'main_fading':
+        hold_suggestion = '2~4周'
     elif sector_level == 'rotating':
         hold_suggestion = '2~4周'
     else:

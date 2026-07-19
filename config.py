@@ -9,10 +9,15 @@ def _load_db_config():
     """从MySQL sys_config表加载敏感配置"""
     import pymysql
     try:
+        # conn = pymysql.connect(
+        #     host='127.0.0.1', port=3306,
+        #     user='root', password='root',
+        #     database='stock_data', charset='utf8mb4',
+        # )
         conn = pymysql.connect(
-            host='127.0.0.1', port=3306,
-            user='root', password='root',
-            database='stock_data', charset='utf8mb4',
+            host='rm-bp1j3918m2i40w4o3go.mysql.rds.aliyuncs.com', port=3306,
+            user='trade', password='1520ZT56jx',
+            database='dbtrade', charset='utf8mb4',
         )
         try:
             with conn.cursor() as cur:

@@ -113,6 +113,30 @@ def load_hist(code, min_rows=35):
     return df
 
 
+def load_hist_batch(codes, min_rows=35):
+    """批量加载多只股票历史数据，一条SQL查回后按code拆分，返回 {code: DataFrame}"""
+    if not codes:
+        return {}
+    conn = _get_conn()
+    try:
+        placeholders = ','.join(['%s'] * len(codes))
+        sql = (
+            "SELECT code, date AS 日期, open AS 开盘, close AS 收盘, "
+            "high AS 最高, low AS 最低, volume AS 成交量 "
+            f"FROM trade_hishq WHERE code IN ({placeholders}) ORDER BY code, date"
+        )
+        df = pd.read_sql_query(sql, conn, params=tuple(codes))
+    finally:
+        _return_conn(conn)
+
+    result = {}
+    for code, group in df.groupby('code'):
+        group = group.drop(columns=['code']).reset_index(drop=True)
+        if len(group) >= min_rows:
+            result[code] = group
+    return result
+
+
 def get_cached_codes(min_rows=35):
     """获取缓存中已有且数据量>=min_rows的股票代码集合"""
     conn = _get_conn()
