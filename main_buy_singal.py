@@ -28,7 +28,7 @@ SALE_CSV = os.path.join(OUTPUT_DIR, 'sale_signals.csv')
 BUY_THRESHOLD = 2
 SALE_THRESHOLD = -2
 
-_CSV_FIELDS = ['代码', '名称', '板块', '日期', '收盘价', '综合得分', 'MACD得分', 'KDJ得分', 'BB得分', '量价得分', '追涨得分', '趋势得分', '相对强度得分', '板块类型', '是否主升', '评级', '建议仓位', '建议持有', '明细']
+_CSV_FIELDS = ['代码', '名称', '板块', '日期', '收盘价', '综合得分', 'MACD得分', 'KDJ得分', 'BB得分', '量价得分', '追涨得分', '趋势得分', '相对强度得分', '板块类型', '是否主升', '评级', '建议仓位', '建议持有', '强力买入胜率', '明细']
 
 from config import ETF_PREFIXES
 
@@ -75,6 +75,37 @@ _buy_etf_csv_written = False
 _sale_csv_written = False
 _sector_map = {}
 _market_env = 'range'
+
+
+def _calc_backtest_winrate(code, hist_df, precomputed_ind, hold_days=10, min_hist=50, step=10, threshold=5):
+    """计算单只股票/ETF历史得分>=threshold时的回测胜率（不含板块强度，避免前视偏差）"""
+    if hist_df is None or precomputed_ind is None or len(precomputed_ind) < min_hist + hold_days:
+        return None
+
+    n = len(precomputed_ind)
+    wins = 0
+    total = 0
+
+    for i in range(min_hist, n - hold_days, step):
+        sub_ind = precomputed_ind.iloc[:i + 1]
+        try:
+            result = score_stock(sub_ind, sector_level=None)
+        except Exception:
+            continue
+        if result is None:
+            continue
+
+        if result['total'] >= threshold:
+            current_close = float(hist_df['收盘'].iloc[i])
+            future_close = float(hist_df['收盘'].iloc[min(i + hold_days, n - 1)])
+            if future_close > current_close:
+                wins += 1
+            total += 1
+
+    if total < 3:
+        return None
+
+    return f'{wins / total:.0%}({total}次)'
 
 
 def _append_csv(path, row, written_flag_name):
@@ -284,6 +315,21 @@ def _run_batch(code_name_list, label, check_sale=False, spot_data=None, buy_thre
                 print(f"\r  [{label} {done}/{total}] 买入{buy_found} 危出{sale_found}          ", end='', flush=True)
                 continue
 
+            # 强力买入/观望试仓：计算该股历史强力买入胜率
+            rating = result['rating']
+            if rating in ('强力买入', '观望/试仓'):
+                pre_ind = hist_cache.get(code)
+                hist_raw = None
+                if pre_ind is not None:
+                    try:
+                        hist_raw = fetch_stock_hist(code, use_cache=True)
+                    except Exception:
+                        pass
+                winrate = _calc_backtest_winrate(code, hist_raw, pre_ind)
+                winrate_str = winrate if winrate else '样本不足'
+            else:
+                winrate_str = '不计算'
+
             row_data = {
                 '代码': result['代码'], '名称': result['名称'],
                 '板块': result['板块'],
@@ -298,9 +344,10 @@ def _run_batch(code_name_list, label, check_sale=False, spot_data=None, buy_thre
                 '相对强度得分': result.get('rs_score', 0),
                 '板块类型': result.get('sector_type', ''),
                 '是否主升': '是' if result.get('sector_type') in ('main', 'main_fading') else '',
-                '评级': result['rating'],
+                '评级': rating,
                 '建议仓位': result.get('position', '0%'),
                 '建议持有': result.get('hold_suggestion', ''),
+                '强力买入胜率': winrate_str,
                 '明细': '; '.join(result['details']),
             }
 

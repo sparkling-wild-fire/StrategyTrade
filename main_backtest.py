@@ -257,7 +257,7 @@ def load_etf_codes_from_db(sectors=None):
 
 def main():
     # ============ 回测参数（直接修改后点Run即可） ============
-    MODE = 'csv'                    # 'csv'=从CSV文件读取, 'etf'=回测全部ETF, 'codes'=指定代码
+    MODE = 'etf'                    # 'csv'=从CSV文件读取, 'etf'=回测全部ETF, 'codes'=指定代码
     CODES = []                      # 指定证券代码，如 ['600048', '000001']；MODE='codes'时生效
     CSV_FILE = DEFAULT_CSV          # CSV文件路径；MODE='csv'时生效
     ETF_SECTORS = []                # 限定ETF板块，如 ['半导体', '创新药']；为空则全部ETF
@@ -265,7 +265,7 @@ def main():
     STEP = 10                       # 采样步长，5=每周 10=每两周
     MIN_HIST = 50                   # 最少历史天数
     MAX_WORKERS = 3                 # 并发线程数
-    LIMIT = 1000                    # 从CSV读取时最多回测只数（0=全部）
+    LIMIT = 50                    # 从CSV读取时最多回测只数（0=全部）
     STOPLOSS = False                # True=止损回测模式
     BUY_THRESHOLD = 2               # 止损回测时的买入阈值
     # ==========================================================

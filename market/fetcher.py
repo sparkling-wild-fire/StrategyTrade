@@ -137,7 +137,7 @@ def _fetch_hist(symbol, start_date=None, end_date=None):
     获取历史数据：股票用腾讯，ETF用新浪财经
     返回统一中文列名
     """
-    start = (start_date or (datetime.now() - timedelta(days=1095)).strftime('%Y%m%d')).replace('-', '')
+    start = (start_date or (datetime.now() - timedelta(days=3650)).strftime('%Y%m%d')).replace('-', '')
     end = (end_date or datetime.now().strftime('%Y%m%d')).replace('-', '')
 
     if _is_etf(symbol):

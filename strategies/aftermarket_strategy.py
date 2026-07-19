@@ -103,6 +103,20 @@ def score(df, sector_avg_return=None, sector_up_ratio=None, sector_vol_trend=Non
 
     total = sum(weighted.values())
 
+    # 过度确认惩罚：趋势完美+动量/突破高分叠加=已涨一大段后再确认，见顶信号
+    # 数据验证：趋势=3+MACD=3 胜率25.9%，趋势=3+BB>=2+MACD<2 胜率34.6%
+    # 三重叠加(趋势3+MACD>=2+BB>=2)胜率仅22%，加重惩罚
+    overconfirm_penalty = False
+    if weighted['trend'] >= 3:
+        macd_high = weighted['macd'] >= 2
+        boll_high = weighted['boll'] >= 2
+        if macd_high and boll_high:
+            total -= 2
+            overconfirm_penalty = True
+        elif macd_high or boll_high:
+            total -= 1
+            overconfirm_penalty = True
+
     # 追高惩罚：按板块强度区分（主升板块追高有效，弱势板块追高风险大）
     close = df['收盘'].iloc[-1]
     ma20 = df['MA20'].iloc[-1]
@@ -146,6 +160,8 @@ def score(df, sector_avg_return=None, sector_up_ratio=None, sector_vol_trend=Non
 
     all_details = (macd_details + kdj_details + bb_details + vol_details
                    + chase_details + trend_details + rs_details + all_details_extra)
+    if overconfirm_penalty:
+        all_details.append('⚠趋势+MACD过度确认-1')
     if kdj_shielded:
         all_details.append('⚠震荡市:KDJ屏蔽')
     if bearish_align:
