@@ -40,6 +40,8 @@ def _is_etf_code(code):
 def _hold_suggestion(level):
     if level == 'main':
         return '1~2月'
+    elif level == 'strong':
+        return '2~4周'
     elif level == 'main_fading':
         return '2~4周'
     elif level == 'rotating':
@@ -52,6 +54,11 @@ def _position_map(level, total):
     if level == 'main':
         if total >= 6:
             return '60%'
+        elif total >= 2:
+            return '30%'
+    elif level == 'strong':
+        if total >= 6:
+            return '50%'
         elif total >= 2:
             return '30%'
     elif level == 'main_fading':
@@ -253,36 +260,48 @@ def _run_batch(code_name_list, label, check_sale=False, spot_data=None, buy_thre
     # 预加载历史数据并计算指标，用于板块平均涨幅
     hist_cache = {}
     print(f"  [{label}] 批量加载历史数据...")
+    _t = time.time()
     codes_to_load = [c for c, _ in code_name_list]
     batch_hist = load_hist_batch(codes_to_load)
-    print(f"  [{label}] 加载完成 {len(batch_hist)}/{total} 只，计算指标...")
+    print(f"  [{label}] 加载完成 {len(batch_hist)}/{total} 只 ({time.time()-_t:.1f}s)，计算指标...")
 
+    _t_ind = time.time()
     loaded = 0
-    for code, name in code_name_list:
+
+    def _calc_one(code_name):
+        code, name = code_name
+        hist_df = batch_hist.get(code)
+        if hist_df is None:
+            return code, None
         try:
-            hist_df = batch_hist.get(code)
-            if hist_df is None:
-                continue
             if spot_data and code in spot_data:
                 today_bar = spot_data[code]
                 today = today_bar['日期']
                 if str(hist_df['日期'].iloc[-1]) < today:
                     hist_df = pd.concat([hist_df, pd.DataFrame([today_bar])], ignore_index=True)
-            df_ind = calculate_all(hist_df)
+            return code, calculate_all(hist_df)
+        except Exception:
+            return code, None
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {pool.submit(_calc_one, (code, name)): code for code, name in code_name_list}
+        for f in as_completed(futures):
+            code, df_ind = f.result()
             if df_ind is not None:
                 hist_cache[code] = df_ind
-        except Exception:
-            pass
-        loaded += 1
-        if loaded % 500 == 0 or loaded == total:
-            print(f"\r  [{label}] 指标计算进度 {loaded}/{total}", end='', flush=True)
-    print()
+            with _lock:
+                loaded += 1
+            if loaded % 500 == 0 or loaded == total:
+                print(f"\r  [{label}] 指标计算进度 {loaded}/{total}", end='', flush=True)
+    print(f"\n  [{label}] 指标计算完成 ({time.time()-_t_ind:.1f}s)")
 
     sector_avg = _compute_sector_info(list(hist_cache.items()), _sector_map)
 
     # 用板块ETF判断当前主升板块
     print(f"  [{label}] 获取板块ETF强度...")
+    _t = time.time()
     etf_sector_strength = get_sector_strength()
+    print(f"  [{label}] 板块ETF强度完成 ({time.time()-_t:.1f}s)")
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = {}
@@ -342,8 +361,10 @@ def _run_batch(code_name_list, label, check_sale=False, spot_data=None, buy_thre
                 '追涨得分': result['chase_score'],
                 '趋势得分': result['trend_score'],
                 '相对强度得分': result.get('rs_score', 0),
+                '形态得分': result.get('pattern_score', 0),
+                '缠论得分': result.get('chanlun_score', 0),
                 '板块类型': result.get('sector_type', ''),
-                '是否主升': '是' if result.get('sector_type') in ('main', 'main_fading') else '',
+                '是否主升': '是' if result.get('sector_type') in ('main', 'strong', 'main_fading') else '',
                 '评级': rating,
                 '建议仓位': result.get('position', '0%'),
                 '建议持有': result.get('hold_suggestion', ''),
@@ -435,12 +456,18 @@ def main(sale_codes=None, max_count=0):
     # ======== 获取数据 ========
 
     print("[INFO] 开始获取并筛选股票列表...")
+    _t = time.time()
     raw_df = get_stock_list()
     stock_df = filter_a_stocks(raw_df)
+    print(f"  [耗时] 获取股票列表: {time.time()-_t:.1f}s")
 
+    _t = time.time()
     etf_df = get_etf_list()
+    print(f"  [耗时] 获取ETF列表: {time.time()-_t:.1f}s")
 
+    _t = time.time()
     _sector_map = get_sector_map()
+    print(f"  [耗时] 获取板块映射: {time.time()-_t:.1f}s")
 
     all_codes = {}
     for _, row in stock_df.iterrows():
@@ -450,14 +477,18 @@ def main(sale_codes=None, max_count=0):
 
     # ======== 基本面前置过滤 ========
 
+    _t = time.time()
     stock_list = [(str(row['代码']).zfill(6), row['名称']) for _, row in stock_df.iterrows()]
     etf_list = [(str(row['代码']).zfill(6), row['名称']) for _, row in etf_df.iterrows()]
 
     stock_list, excluded = filter_by_fundamentals(stock_list, enabled=FUNDAMENTAL_FILTER_ENABLED)
+    print(f"  [耗时] 基本面过滤: {time.time()-_t:.1f}s (排除{excluded}只)")
 
     # ======== 市场环境检测 ========
 
+    _t = time.time()
     _market_env = detect_market_env(enabled=MARKET_ENV_ENABLED)
+    print(f"  [耗时] 市场环境检测: {time.time()-_t:.1f}s")
     if _market_env == 'bear':
         effective_buy_threshold = BEAR_BUY_THRESHOLD
         print(f"[INFO] 熊市环境，买入阈值提高到 ≥{effective_buy_threshold}")
@@ -474,17 +505,25 @@ def main(sale_codes=None, max_count=0):
     analyze_codes = [c for c, _ in stock_list] + [c for c, _ in etf_list]
     if sale_codes:
         analyze_codes += [str(c).strip() for c in sale_codes]
+    _t = time.time()
     prefetch_hist_batch(analyze_codes)
+    print(f"  [耗时] 批量预加载: {time.time()-_t:.1f}s")
 
+    _t = time.time()
     spot_data = fetch_spot_data()
+    print(f"  [耗时] 获取盘中行情: {time.time()-_t:.1f}s")
 
     # ======== 买入信号：证券+ETF ========
 
+    _t = time.time()
     calculate_buy_signals(stock_list, etf_list, spot_data=spot_data, buy_threshold=effective_buy_threshold)
+    print(f"  [耗时] 买入信号分析: {time.time()-_t:.1f}s")
 
     # ======== 卖出信号：仅分析指定代码 ========
 
+    _t = time.time()
     calculate_sell_signals(sale_codes, all_codes, spot_data=spot_data)
+    print(f"  [耗时] 卖出信号分析: {time.time()-_t:.1f}s")
 
     # ======== 按得分排序CSV ========
 

@@ -1,4 +1,4 @@
-from factors import score_macd, score_kdj, score_boll, score_volume, score_chase, score_trend, score_rs
+from factors import score_macd, score_kdj, score_boll, score_volume, score_chase, score_trend, score_rs, score_pattern, score_chanlun
 
 # 维度权重
 WEIGHTS = {
@@ -9,10 +9,12 @@ WEIGHTS = {
     'chase': 1.0,
     'trend': 1.0,
     'rs': 0.8,
+    'pattern': 1.0,
+    'chanlun': 0.8,
 }
 
 # 追涨类信号（主升板块时放大，弱势板块时打折）
-_MOMENTUM_FACTORS = {'macd', 'kdj', 'boll', 'trend'}
+_MOMENTUM_FACTORS = {'macd', 'kdj', 'boll', 'trend', 'pattern'}
 
 
 def _adjust_buy(score_val, factor):
@@ -52,6 +54,8 @@ def score(df, sector_avg_return=None, sector_up_ratio=None, sector_vol_trend=Non
     chase_score, chase_details = score_chase(df)
     trend_score, trend_details = score_trend(df)
     rs_score, rs_details = score_rs(df, sector_avg_return)
+    pattern_score, pattern_details = score_pattern(df)
+    chanlun_score, chanlun_details = score_chanlun(df)
 
     # 震荡市KDJ屏蔽
     kdj_shielded = False
@@ -61,9 +65,11 @@ def score(df, sector_avg_return=None, sector_up_ratio=None, sector_vol_trend=Non
         kdj_shielded = True
 
     # 板块强度仅用于调整追涨因子权重，不单独作为评分因子
-    # 主升持续中 → 适度放大；主升尾声 → 不放大；轮动 → 适度放大；弱势 → 大幅打折
+    # 主升=市场最强 → 适度放大；强势=本身强 → 适度放大；主升尾声 → 不放大；轮动 → 适度放大；弱势 → 大幅打折
     if sector_level == 'main':
         momentum_factor = 1.2
+    elif sector_level == 'strong':
+        momentum_factor = 1.1
     elif sector_level == 'main_fading':
         momentum_factor = 1.0
     elif sector_level == 'weak':
@@ -92,7 +98,7 @@ def score(df, sector_avg_return=None, sector_up_ratio=None, sector_vol_trend=Non
     raw_scores = {
         'macd': macd_score, 'kdj': kdj_score, 'boll': bb_score,
         'volume': vol_score, 'chase': chase_score, 'trend': trend_score,
-        'rs': rs_score,
+        'rs': rs_score, 'pattern': pattern_score, 'chanlun': chanlun_score,
     }
 
     for key, val in raw_scores.items():
@@ -125,6 +131,13 @@ def score(df, sector_avg_return=None, sector_up_ratio=None, sector_vol_trend=Non
         if sector_level == 'main':
             # 主升板块：追高是趋势确认，不惩罚
             all_details_extra = []
+        elif sector_level == 'strong':
+            # 强势板块：追高基本有效，轻微限制
+            if deviation > 0.10:
+                total -= 1
+                all_details_extra = ['⚠偏离均线-1']
+            else:
+                all_details_extra = []
         elif sector_level == 'main_fading':
             # 主升尾声：轻微惩罚
             if deviation > 0.10:
@@ -158,8 +171,18 @@ def score(df, sector_avg_return=None, sector_up_ratio=None, sector_vol_trend=Non
     neg_count = sum(1 for v in weighted.values() if v < 0)
     quality_ok = (has_trend or has_momentum) and neg_count <= 2
 
+    # 共振加分：缠论底分型 + K线看涨形态 + 放量 → 额外+2
+    resonance_bonus = 0
+    has_chanlun_bottom = any('底分型' in d for d in chanlun_details)
+    has_bullish_pattern = pattern_score >= 2
+    has_volume = vol_score > 0
+    if has_chanlun_bottom and has_bullish_pattern and has_volume:
+        resonance_bonus = 2
+        total += 2
+
     all_details = (macd_details + kdj_details + bb_details + vol_details
-                   + chase_details + trend_details + rs_details + all_details_extra)
+                   + chase_details + trend_details + rs_details
+                   + pattern_details + chanlun_details + all_details_extra)
     if overconfirm_penalty:
         all_details.append('⚠趋势+MACD过度确认-1')
     if kdj_shielded:
@@ -170,10 +193,14 @@ def score(df, sector_avg_return=None, sector_up_ratio=None, sector_vol_trend=Non
         all_details.append('✅多头排列:买入项×1.2')
     if sector_level == 'main':
         all_details.append('🔥主升板块:追涨×1.2')
+    elif sector_level == 'strong':
+        all_details.append('📈强势板块:追涨×1.1')
     elif sector_level == 'main_fading':
         all_details.append('⚠主升尾声:追涨×1.0')
     elif sector_level == 'weak':
         all_details.append('🔻弱势板块:追涨×0.3')
+    if resonance_bonus:
+        all_details.append('🔥缠论+形态+放量共振+2')
 
     # 综合评级（买入质量不达标时降档）
     if total >= 6 and quality_ok:
@@ -183,7 +210,7 @@ def score(df, sector_avg_return=None, sector_up_ratio=None, sector_vol_trend=Non
         all_details.append('⚠质量不足:降为观望')
     elif total >= 2:
         rating = '观望/试仓'
-    elif total <= -5 and sector_level not in ('rotating', 'main', 'main_fading'):
+    elif total <= -5 and sector_level not in ('rotating', 'main', 'strong', 'main_fading'):
         rating = '坚决卖出'
     else:
         rating = '中性'
@@ -192,6 +219,13 @@ def score(df, sector_avg_return=None, sector_up_ratio=None, sector_vol_trend=Non
     if sector_level == 'main':
         if total >= 6:
             position = '60%'
+        elif total >= 2:
+            position = '30%'
+        else:
+            position = '0%'
+    elif sector_level == 'strong':
+        if total >= 6:
+            position = '50%'
         elif total >= 2:
             position = '30%'
         else:
@@ -214,6 +248,8 @@ def score(df, sector_avg_return=None, sector_up_ratio=None, sector_vol_trend=Non
     # 持有期建议
     if sector_level == 'main':
         hold_suggestion = '1~2月'
+    elif sector_level == 'strong':
+        hold_suggestion = '2~4周'
     elif sector_level == 'main_fading':
         hold_suggestion = '2~4周'
     elif sector_level == 'rotating':
@@ -230,6 +266,8 @@ def score(df, sector_avg_return=None, sector_up_ratio=None, sector_vol_trend=Non
         'chase_score': weighted['chase'],
         'trend_score': weighted['trend'],
         'rs_score': weighted['rs'],
+        'pattern_score': weighted['pattern'],
+        'chanlun_score': weighted['chanlun'],
         'sector_score': 0,
         'rating': rating,
         'position': position,

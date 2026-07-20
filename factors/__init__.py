@@ -7,6 +7,8 @@ from factors.volume import calculate as calc_vol, score as score_volume
 from factors.chase import score as score_chase
 from factors.relative_strength import score as score_rs
 from factors.sector_strength import score as score_sector_strength
+from factors.pattern import calculate as calc_pattern, score as score_pattern
+from factors.chanlun import calculate as calc_chanlun, score as score_chanlun
 
 
 def calculate_all(df):
@@ -27,4 +29,6 @@ def calculate_all(df):
 
     calc_ma(df)
     calc_vol(df)
+    calc_pattern(df)
+    calc_chanlun(df)
     return df

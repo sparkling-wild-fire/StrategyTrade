@@ -3,9 +3,10 @@ from market import fetch_stock_hist, get_etf_list
 from sector import JQ_L1_TO_SECTOR
 
 # 主升判定阈值
-_MAIN_RALLY_RETURN = 0.06   # 20日涨幅>6%
-_MAIN_RALLY_VOL_RATIO = 1.0  # 近5日均量 ≥ 近20日均量
+_MAIN_RALLY_RETURN = 0.06   # 15日涨幅>6%
+_MAIN_RALLY_VOL_RATIO = 1.0  # 近5日均量 ≥ 近15日均量
 _MAIN_RALLY_BULLISH = True   # 必须均线多头排列
+_STRENGTH_PERIOD = 15        # 强度计算周期（日）
 
 # 缓存
 _etf_df_cache = None
@@ -22,35 +23,36 @@ def _get_etf_df():
 
 def _calc_etf_strength_from_hist(hist_df):
     """从ETF历史数据计算趋势强度（截取到某一天的数据即可用于回测）"""
-    if hist_df is None or len(hist_df) < 20:
+    p = _STRENGTH_PERIOD
+    if hist_df is None or len(hist_df) < p:
         return None
 
     close = hist_df['收盘']
     volume = hist_df['成交量']
 
-    ret_20 = (close.iloc[-1] - close.iloc[-20]) / close.iloc[-20]
+    ret = (close.iloc[-1] - close.iloc[-p]) / close.iloc[-p]
     vol_5 = volume.iloc[-5:].mean()
-    vol_20 = volume.iloc[-20:].mean()
-    vol_ratio = vol_5 / vol_20 if vol_20 > 0 else 1
+    vol_p = volume.iloc[-p:].mean()
+    vol_ratio = vol_5 / vol_p if vol_p > 0 else 1
 
     ma5 = close.rolling(5).mean().iloc[-1]
     ma10 = close.rolling(10).mean().iloc[-1]
     ma20 = close.rolling(20).mean().iloc[-1]
     bullish_align = ma5 > ma10 > ma20
 
-    is_main_rally = (ret_20 > _MAIN_RALLY_RETURN
+    is_main_rally = (ret > _MAIN_RALLY_RETURN
                      and vol_ratio > _MAIN_RALLY_VOL_RATIO
                      and bullish_align)
 
     # 主升衰竭判定：均线还多头但量能萎缩或近5日涨幅放缓
     is_fading = False
-    if bullish_align and ret_20 > _MAIN_RALLY_RETURN:
+    if bullish_align and ret > _MAIN_RALLY_RETURN:
         ret_5 = (close.iloc[-1] - close.iloc[-5]) / close.iloc[-5] if len(close) >= 5 else 0
-        if vol_ratio < 0.9 or ret_5 < ret_20 * 0.2:
+        if vol_ratio < 0.9 or ret_5 < ret * 0.2:
             is_fading = True
 
     return {
-        'return_20': ret_20,
+        'return': ret,
         'vol_ratio': vol_ratio,
         'bullish_align': bullish_align,
         'is_main_rally': is_main_rally,
@@ -58,17 +60,25 @@ def _calc_etf_strength_from_hist(hist_df):
     }
 
 
-def _classify_level(strength):
-    """根据ETF强度信息分级"""
+def _classify_level(strength, is_market_best=False):
+    """根据ETF强度信息分级
+    main: 市场最强板块 且 本身强度高（涨幅>6%+量能+多头排列）
+    strong: 本身强度高（涨幅>6%+多头排列）但不是市场最强
+    main_fading: 主升衰竭
+    rotating: 温和上涨
+    weak: 弱势
+    """
     if strength is None:
         return 'weak'
-    if strength['is_main_rally']:
+    if strength['is_main_rally'] and is_market_best:
         return 'main'
+    if strength['is_main_rally']:
+        return 'strong'
     if strength.get('is_fading'):
         return 'main_fading'
-    if strength['return_20'] > 0.02 and strength['bullish_align']:
+    if strength['return'] > 0.02 and strength['bullish_align']:
         return 'rotating'
-    if strength['return_20'] > 0.03:
+    if strength['return'] > 0.03:
         return 'rotating'
     return 'weak'
 
@@ -107,15 +117,22 @@ def get_sector_strength():
         for code in etf_codes:
             strength = _calc_etf_strength(code)
             if strength is not None:
-                if best is None or strength['return_20'] > best['return_20']:
+                if best is None or strength['return'] > best['return']:
                     best = strength
 
         if best is None:
-            result[sector] = {'level': 'weak', 'return_20': 0, 'vol_ratio': 1, 'bullish_align': False, 'is_main_rally': False}
+            result[sector] = {'level': 'weak', 'return': 0, 'vol_ratio': 1, 'bullish_align': False, 'is_main_rally': False}
             continue
 
-        best['level'] = _classify_level(best)
         result[sector] = best
+
+    # 找出市场最强板块（return最高的且is_main_rally的板块）
+    rally_sectors = {s: v for s, v in result.items() if v.get('is_main_rally')}
+    best_sector = max(rally_sectors, key=lambda s: rally_sectors[s]['return']) if rally_sectors else None
+
+    for sector, info in result.items():
+        is_best = (sector == best_sector)
+        info['level'] = _classify_level(info, is_market_best=is_best)
 
     _print_sector_strength(result)
     return result
@@ -136,12 +153,12 @@ def get_sector_strength_at_date(etf_hist_map, date_str):
                 continue
             dates = hist['日期'].astype(str)
             mask = dates <= date_str
-            if mask.sum() < 20:
+            if mask.sum() < _STRENGTH_PERIOD:
                 continue
             sub = hist[mask].copy()
             strength = _calc_etf_strength_from_hist(sub)
             if strength is not None:
-                if best_strength is None or strength['return_20'] > best_strength['return_20']:
+                if best_strength is None or strength['return'] > best_strength['return']:
                     best_strength = strength
 
         result[sector] = _classify_level(best_strength)
@@ -194,11 +211,11 @@ def load_etf_hist_map():
 
 def _print_sector_strength(strength_map):
     """打印板块强度"""
-    level_names = {'main': '主升', 'main_fading': '主升尾声', 'rotating': '轮动', 'weak': '弱势'}
+    level_names = {'main': '主升', 'strong': '强势', 'main_fading': '主升尾声', 'rotating': '轮动', 'weak': '弱势'}
     print("\n[板块ETF强度]")
-    sorted_sectors = sorted(strength_map.items(), key=lambda x: x[1].get('return_20', 0), reverse=True)
+    sorted_sectors = sorted(strength_map.items(), key=lambda x: x[1].get('return', 0), reverse=True)
     for sector, info in sorted_sectors:
         level = info.get('level', 'weak')
-        ret = info.get('return_20', 0)
-        flag = ' <<<' if level in ('main', 'main_fading') else ''
-        print(f"  {sector}: {level_names[level]} 20日{ret:.1%}{flag}")
+        ret = info.get('return', 0)
+        flag = ' <<<' if level in ('main', 'strong', 'main_fading') else ''
+        print(f"  {sector}: {level_names[level]} {_STRENGTH_PERIOD}日{ret:.1%}{flag}")

@@ -2,6 +2,13 @@
 import pandas as pd
 from utils import retry_with_backoff
 
+_INDEX_CONFIG = [
+    ('sh000001', '上证指数'),
+    ('sz399006', '创业板指'),
+    ('sh000688', '科创50'),
+    ('sh000852', '中证1000'),
+]
+
 
 def _fetch_index_hist(symbol='sh000001', days=120):
     """获取指数历史数据"""
@@ -16,32 +23,17 @@ def _fetch_index_hist(symbol='sh000001', days=120):
     return df
 
 
-def detect_market_env(enabled=True):
-    """
-    检测市场环境（牛市/震荡/熊市）
-
-    判断逻辑:
-    - 牛市: 上证MA20 > MA60 且 MACD金叉(近5日DIF上穿DEA)
-    - 熊市: 上证MA20 < MA60 且 MACD死叉(近5日DIF下穿DEA)
-    - 震荡: 其他
-
-    返回: 'bull' / 'bear' / 'range'
-    """
-    if not enabled:
-        print("[INFO] 市场环境检测已禁用，默认震荡市")
-        return 'range'
-
+def _analyze_index(symbol, days=120):
+    """分析单个指数，返回 (ma20_vs_ma60, golden, death, dif_below_dea, ma20, ma60) 或 None"""
     try:
-        df = retry_with_backoff(_fetch_index_hist)
+        df = retry_with_backoff(lambda: _fetch_index_hist(symbol, days))
         if df is None or len(df) < 60:
-            print("[WARN] 指数数据不足，默认震荡市")
-            return 'range'
+            return None
 
         close = df['收盘'].astype(float)
         ma20 = close.rolling(20).mean()
         ma60 = close.rolling(60).mean()
 
-        # MACD
         ema12 = close.ewm(span=12, adjust=False).mean()
         ema26 = close.ewm(span=26, adjust=False).mean()
         dif = ema12 - ema26
@@ -49,8 +41,8 @@ def detect_market_env(enabled=True):
 
         curr_ma20 = ma20.iloc[-1]
         curr_ma60 = ma60.iloc[-1]
+        ma20_above = curr_ma20 > curr_ma60
 
-        # 检查近5日金叉/死叉
         golden = False
         death = False
         for i in range(-5, 0):
@@ -59,17 +51,72 @@ def detect_market_env(enabled=True):
             if dif.iloc[i] < dea.iloc[i] and dif.iloc[i - 1] >= dea.iloc[i - 1]:
                 death = True
 
-        if curr_ma20 > curr_ma60 and golden:
-            env = 'bull'
-        elif curr_ma20 < curr_ma60 and death:
-            env = 'bear'
-        else:
-            env = 'range'
+        # DIF持续在DEA下方（近5日DIF均<DEA）
+        dif_below_dea = all(dif.iloc[i] < dea.iloc[i] for i in range(-5, 0))
 
-        env_names = {'bull': '牛市/强势', 'bear': '熊市/弱势', 'range': '震荡市'}
-        print(f"[OK] 市场环境: {env_names[env]} (MA20={curr_ma20:.0f} MA60={curr_ma60:.0f} 金叉={golden} 死叉={death})")
-        return env
+        return {
+            'ma20_above': ma20_above,
+            'golden': golden,
+            'death': death,
+            'dif_below_dea': dif_below_dea,
+            'ma20': curr_ma20,
+            'ma60': curr_ma60,
+        }
+    except Exception:
+        return None
 
-    except Exception as e:
-        print(f"[WARN] 市场环境检测失败: {e}，默认震荡市")
+
+def detect_market_env(enabled=True):
+    """
+    检测市场环境（牛市/震荡/熊市）
+
+    多指数综合判断：
+    - 熊市: 多数指数MA20<MA60（≥2/4），且(有死叉 或 DIF持续在DEA下方)
+    - 牛市: 多数指数MA20>MA60（≥3/4），且至少一个近5日金叉
+    - 震荡: 其他
+
+    返回: 'bull' / 'bear' / 'range'
+    """
+    if not enabled:
+        print("[INFO] 市场环境检测已禁用，默认震荡市")
         return 'range'
+
+    results = {}
+    for symbol, name in _INDEX_CONFIG:
+        r = _analyze_index(symbol)
+        if r is not None:
+            results[name] = r
+
+    if not results:
+        print("[WARN] 指数数据全部获取失败，默认震荡市")
+        return 'range'
+
+    bear_count = sum(1 for r in results.values() if not r['ma20_above'])
+    bull_count = sum(1 for r in results.values() if r['ma20_above'])
+    has_death = any(r['death'] for r in results.values())
+    has_dif_below = any(r['dif_below_dea'] for r in results.values())
+    has_golden = any(r['golden'] for r in results.values())
+
+    # 熊市：多数指数MA20<MA60，且MACD确认弱势
+    if bear_count >= 2 and (has_death or has_dif_below):
+        env = 'bear'
+    # 牛市：多数指数MA20>MA60，且有金叉确认
+    elif bull_count >= 3 and has_golden:
+        env = 'bull'
+    else:
+        env = 'range'
+
+    env_names = {'bull': '牛市/强势', 'bear': '熊市/弱势', 'range': '震荡市'}
+    print(f"[OK] 市场环境: {env_names[env]}")
+    for name, r in results.items():
+        status = 'MA20>MA60' if r['ma20_above'] else 'MA20<MA60'
+        cross = ''
+        if r['golden']:
+            cross = ' 金叉'
+        if r['death']:
+            cross = ' 死叉'
+        if r['dif_below_dea'] and not r['death']:
+            cross = ' DIF<DEA'
+        print(f"       {name}: {status} (MA20={r['ma20']:.0f} MA60={r['ma60']:.0f}{cross})")
+
+    return env
