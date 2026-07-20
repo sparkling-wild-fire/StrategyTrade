@@ -1,4 +1,12 @@
 import os
+
+# V8(PartitionAlloc)在Python 3.11多线程下会崩溃，主线程提前初始化避免重复初始化
+try:
+    from py_mini_racer import MiniRacer
+    MiniRacer().execute('1')
+except Exception:
+    pass
+
 import akshare as ak
 import pandas as pd
 from datetime import datetime, timedelta

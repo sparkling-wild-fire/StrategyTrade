@@ -155,7 +155,7 @@ def get_etf_sector(etf_code):
     row = df[df['代码'].astype(str).str.strip().str.zfill(6) == str(etf_code).zfill(6)]
     if len(row) > 0 and '所属板块' in df.columns:
         sector = str(row.iloc[0].get('所属板块', '')).strip()
-        if sector and sector not in ('宽基', '红利', '策略', '区域', '央企'):
+        if sector:
             return sector
     return '其他'
 
