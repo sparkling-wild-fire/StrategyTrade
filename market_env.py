@@ -3,10 +3,10 @@ import pandas as pd
 from utils import retry_with_backoff
 
 _INDEX_CONFIG = [
-    ('sh000001', '上证指数'),
-    ('sz399006', '创业板指'),
-    ('sh000688', '科创50'),
-    ('sh000852', '中证1000'),
+    ('sh000001', '上证指数', '000001'),
+    ('sz399006', '创业板指', '399006'),
+    ('sh000688', '科创50', '000688'),
+    ('sh000852', '中证1000', '000852'),
 ]
 
 
@@ -23,10 +23,63 @@ def _fetch_index_hist(symbol='sh000001', days=120):
     return df
 
 
-def _analyze_index(symbol, days=120):
-    """分析单个指数，返回 (ma20_vs_ma60, golden, death, dif_below_dea, ma20, ma60) 或 None"""
+def _load_index_from_db(db_code, days=120):
+    """从数据库读取指数历史数据"""
+    from market.cache import _get_conn, _return_conn
+    conn = _get_conn()
     try:
-        df = retry_with_backoff(lambda: _fetch_index_hist(symbol, days))
+        sql = (
+            "SELECT date AS 日期, open AS 开盘, close AS 收盘, "
+            "high AS 最高, low AS 最低, volume AS 成交量 "
+            "FROM trade_hishq WHERE code = %s ORDER BY date DESC LIMIT %s"
+        )
+        df = pd.read_sql_query(sql, conn, params=(db_code, days))
+    finally:
+        _return_conn(conn)
+    if df.empty:
+        return None
+    df = df.iloc[::-1].reset_index(drop=True)  # 按日期正序
+    return df
+
+
+def _save_index_to_db(db_code, df):
+    """将指数历史数据保存到数据库"""
+    from market.cache import _get_conn, _return_conn
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            rows = [
+                (db_code, str(r['日期']), r['开盘'], r['收盘'], r['最高'], r['最低'], r['成交量'])
+                for _, r in df.iterrows()
+            ]
+            cur.executemany(
+                "REPLACE INTO trade_hishq (code, date, open, close, high, low, volume) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s)", rows,
+            )
+        conn.commit()
+    finally:
+        _return_conn(conn)
+
+
+def _get_index_hist(symbol, db_code, days=120):
+    """获取指数历史数据：优先从DB读，缺失则走API并缓存"""
+    df = _load_index_from_db(db_code, days)
+    if df is not None and len(df) >= 60:
+        return df
+
+    df = retry_with_backoff(lambda: _fetch_index_hist(symbol, days))
+    if df is not None and not df.empty:
+        try:
+            _save_index_to_db(db_code, df)
+        except Exception:
+            pass
+    return df
+
+
+def _analyze_index(symbol, db_code, days=120):
+    """分析单个指数，返回分析结果或None"""
+    try:
+        df = _get_index_hist(symbol, db_code, days)
         if df is None or len(df) < 60:
             return None
 
@@ -82,8 +135,8 @@ def detect_market_env(enabled=True):
         return 'range'
 
     results = {}
-    for symbol, name in _INDEX_CONFIG:
-        r = _analyze_index(symbol)
+    for symbol, name, db_code in _INDEX_CONFIG:
+        r = _analyze_index(symbol, db_code)
         if r is not None:
             results[name] = r
 

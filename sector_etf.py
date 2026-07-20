@@ -1,5 +1,6 @@
 # sector_etf.py — 用板块ETF判断当前主升板块
 from market import fetch_stock_hist, get_etf_list
+from market.cache import load_hist_batch
 from sector import JQ_L1_TO_SECTOR
 
 # 主升判定阈值
@@ -11,6 +12,8 @@ _STRENGTH_PERIOD = 15        # 强度计算周期（日）
 # 缓存
 _etf_df_cache = None
 _sector_etf_map_cache = None
+_sector_strength_cache = None
+_etf_strength_detail_cache = {}  # {etf_code: strength_info}
 
 
 def _get_etf_df():
@@ -40,14 +43,27 @@ def _calc_etf_strength_from_hist(hist_df):
     ma20 = close.rolling(20).mean().iloc[-1]
     bullish_align = ma5 > ma10 > ma20
 
+    # 近期走势检测：3日和5日涨跌幅
+    ret_3 = (close.iloc[-1] - close.iloc[-3]) / close.iloc[-3] if len(close) >= 3 else 0
+    ret_5 = (close.iloc[-1] - close.iloc[-5]) / close.iloc[-5] if len(close) >= 5 else 0
+
+    # 近期转跌：5日跌>2% 或 3日跌>3%，说明涨势已经结束
+    recent_decline = ret_5 < -0.02 or ret_3 < -0.03
+
+    # 价格跌破MA5：短期趋势已走弱
+    below_ma5 = close.iloc[-1] < ma5
+
+    # 均线还在多头但价格已跌破MA5且近期下跌 → 涨后回落
+    is_falling_back = bullish_align and (recent_decline or below_ma5)
+
     is_main_rally = (ret > _MAIN_RALLY_RETURN
                      and vol_ratio > _MAIN_RALLY_VOL_RATIO
-                     and bullish_align)
+                     and bullish_align
+                     and not recent_decline)
 
     # 主升衰竭判定：均线还多头但量能萎缩或近5日涨幅放缓
     is_fading = False
-    if bullish_align and ret > _MAIN_RALLY_RETURN:
-        ret_5 = (close.iloc[-1] - close.iloc[-5]) / close.iloc[-5] if len(close) >= 5 else 0
+    if bullish_align and ret > _MAIN_RALLY_RETURN and not recent_decline:
         if vol_ratio < 0.9 or ret_5 < ret * 0.2:
             is_fading = True
 
@@ -57,19 +73,29 @@ def _calc_etf_strength_from_hist(hist_df):
         'bullish_align': bullish_align,
         'is_main_rally': is_main_rally,
         'is_fading': is_fading,
+        'ret_3': ret_3,
+        'ret_5': ret_5,
+        'recent_decline': recent_decline,
+        'is_falling_back': is_falling_back,
     }
 
 
 def _classify_level(strength, is_market_best=False):
     """根据ETF强度信息分级
-    main: 市场最强板块 且 本身强度高（涨幅>6%+量能+多头排列）
-    strong: 本身强度高（涨幅>6%+多头排列）但不是市场最强
-    main_fading: 主升衰竭
+    main: 市场最强板块 且 本身强度高（涨幅>6%+量能+多头排列+近期未下跌）
+    strong: 本身强度高（涨幅>6%+多头排列+近期未下跌）但不是市场最强
+    main_fading: 主升衰竭（均线还多头但量能萎缩/涨幅放缓）
+    falling_back: 涨后回落（15日还涨但近期已转跌，均线多头但价格跌破MA5）
     rotating: 温和上涨
     weak: 弱势
     """
     if strength is None:
         return 'weak'
+    # 近期已转跌，即使15日还涨也不应判为主升/强势
+    if strength.get('is_falling_back'):
+        if strength.get('recent_decline') and strength['ret_5'] < -0.03:
+            return 'weak'
+        return 'rotating'
     if strength['is_main_rally'] and is_market_best:
         return 'main'
     if strength['is_main_rally']:
@@ -108,15 +134,31 @@ def _load_sector_etf_map():
 
 
 def get_sector_strength():
-    """获取各板块当前强度（基于板块ETF），用于实盘"""
-    sector_etf = _load_sector_etf_map()
-    result = {}
+    """获取各板块当前强度（基于板块ETF），带缓存避免重复计算和打印"""
+    global _sector_strength_cache, _etf_strength_detail_cache
+    if _sector_strength_cache is not None:
+        return _sector_strength_cache
 
+    sector_etf = _load_sector_etf_map()
+
+    # 批量从DB加载所有行业ETF历史数据
+    all_codes = []
+    for codes in sector_etf.values():
+        all_codes.extend(codes)
+    batch_hist = load_hist_batch(all_codes)
+    print(f"  板块ETF历史数据加载 {len(batch_hist)}/{len(all_codes)} 只")
+
+    result = {}
+    etf_detail = {}
     for sector, etf_codes in sector_etf.items():
         best = None
         for code in etf_codes:
-            strength = _calc_etf_strength(code)
+            hist = batch_hist.get(code)
+            if hist is None:
+                continue
+            strength = _calc_etf_strength_from_hist(hist)
             if strength is not None:
+                etf_detail[code] = strength
                 if best is None or strength['return'] > best['return']:
                     best = strength
 
@@ -135,6 +177,8 @@ def get_sector_strength():
         info['level'] = _classify_level(info, is_market_best=is_best)
 
     _print_sector_strength(result)
+    _sector_strength_cache = result
+    _etf_strength_detail_cache = etf_detail
     return result
 
 
@@ -167,19 +211,23 @@ def get_sector_strength_at_date(etf_hist_map, date_str):
 
 
 def get_etf_sector(etf_code):
-    """查询单只ETF所属板块"""
-    df = _get_etf_df()
-    row = df[df['代码'].astype(str).str.strip().str.zfill(6) == str(etf_code).zfill(6)]
-    if len(row) > 0 and '所属板块' in df.columns:
-        sector = str(row.iloc[0].get('所属板块', '')).strip()
-        if sector:
-            return sector
-    return '其他'
+    """查询单只ETF所属板块（带缓存）"""
+    if not hasattr(get_etf_sector, '_cache'):
+        df = _get_etf_df()
+        cache = {}
+        for _, row in df.iterrows():
+            code = str(row['代码']).strip().zfill(6)
+            sector = str(row.get('所属板块', '')).strip() if '所属板块' in df.columns else ''
+            cache[code] = sector if sector else '其他'
+        get_etf_sector._cache = cache
+    return get_etf_sector._cache.get(str(etf_code).zfill(6), '其他')
 
 
 def get_etf_main_rally_info(etf_code):
-    """判断单只ETF是否属于主升板块，用于实盘ETF信号"""
-    strength = _calc_etf_strength(etf_code)
+    """判断单只ETF是否属于主升板块，优先从缓存读取"""
+    strength = _etf_strength_detail_cache.get(etf_code)
+    if strength is None:
+        strength = _calc_etf_strength(etf_code)
     if strength is None:
         return False, '其他', 'weak'
 
@@ -211,7 +259,7 @@ def load_etf_hist_map():
 
 def _print_sector_strength(strength_map):
     """打印板块强度"""
-    level_names = {'main': '主升', 'strong': '强势', 'main_fading': '主升尾声', 'rotating': '轮动', 'weak': '弱势'}
+    level_names = {'main': '主升', 'strong': '强势', 'main_fading': '主升尾声', 'falling_back': '涨后回落', 'rotating': '轮动', 'weak': '弱势'}
     print("\n[板块ETF强度]")
     sorted_sectors = sorted(strength_map.items(), key=lambda x: x[1].get('return', 0), reverse=True)
     for sector, info in sorted_sectors:

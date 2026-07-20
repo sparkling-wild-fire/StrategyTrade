@@ -93,11 +93,12 @@ def calculate(df):
     """计算缠论结构，结果存入df属性（不存列，避免污染DataFrame）"""
     if len(df) < 10:
         return
-    merged = _merge_inclusion(df)
+    # 缠论只需要看最近结构，截断到60行加速
+    src = df.iloc[-60:] if len(df) > 60 else df
+    merged = _merge_inclusion(src)
     fractals = _find_fractals(merged)
     bis = _find_bis(fractals, merged)
     pivot = _find_pivot(bis, merged)
-    # 存到df.attrs避免Pandas列警告
     df.attrs['chanlun'] = {
         'merged': merged,
         'fractals': fractals,

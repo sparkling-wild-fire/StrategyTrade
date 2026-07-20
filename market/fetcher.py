@@ -12,7 +12,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from utils import retry_with_backoff
-from market.cache import get_last_date, get_last_check, set_last_check, save_hist, load_hist, get_cached_codes, get_stale_codes
+from market.cache import get_last_date, get_last_check, set_last_check, save_hist, load_hist, get_cached_codes, get_stale_codes, _get_conn as _get_db_conn, _return_conn as _return_db_conn
 from config import ETF_PREFIXES
 
 _CACHE_FILE = os.path.join(os.path.dirname(__file__), '.last_source')
@@ -33,8 +33,16 @@ _KEEP_COLS = ['日期', '开盘', '收盘', '最高', '最低', '成交量']
 
 
 def _prev_trade_date():
-    """获取上一个交易日（简单跳过周末）"""
-    d = datetime.now() - timedelta(days=1)
+    """获取最新可用数据的日期（盘后/周末返回最近交易日，盘中返回前一交易日）"""
+    now = datetime.now()
+    if _is_market_closed():
+        # 已收盘或周末：返回最近的交易日（当天或之前最后一个工作日）
+        d = now
+        while d.weekday() >= 5:
+            d -= timedelta(days=1)
+        return d.strftime('%Y-%m-%d')
+    # 盘中：前一交易日
+    d = now - timedelta(days=1)
     while d.weekday() >= 5:
         d -= timedelta(days=1)
     return d.strftime('%Y-%m-%d')
@@ -77,7 +85,22 @@ def fetch_stock_list_sina():
 
 
 def get_stock_list():
-    """获取A股列表，使用新浪财经"""
+    """获取A股列表：优先从数据库trade_hishq读取，失败则走API"""
+    from config import STOCK_PREFIXES
+    try:
+        conn = _get_db_conn()
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT code FROM trade_hishq")
+            codes = [r[0] for r in cur.fetchall()]
+        _return_db_conn(conn)
+        # 筛选A股代码
+        filtered = [c for c in codes if c[:2] in STOCK_PREFIXES]
+        df = pd.DataFrame({'代码': filtered, '名称': filtered})
+        print(f"[OK] 从数据库获取 {len(df)} 只A股")
+        return df
+    except Exception as e:
+        print(f"[WARN] 数据库获取股票列表失败: {e}，回退到API...")
+
     try:
         print("[INFO] 从新浪财经获取股票列表...")
         df = retry_with_backoff(fetch_stock_list_sina)
@@ -90,8 +113,57 @@ def get_stock_list():
 
 # ==================== 盘中实时行情 ====================
 
+def _is_market_closed():
+    """判断当前是否已收盘（15:05后视为收盘）"""
+    now = datetime.now()
+    if now.weekday() >= 5:
+        return True
+    return now.hour > 15 or (now.hour == 15 and now.minute >= 5)
+
+
+def _fetch_spot_from_db():
+    """从数据库trade_hishq获取最新一条记录作为行情数据"""
+    conn = _get_db_conn()
+    try:
+        sql = (
+            "SELECT h.code, h.date, h.open, h.close, h.high, h.low, h.volume "
+            "FROM trade_hishq h "
+            "INNER JOIN (SELECT code, MAX(date) AS max_date FROM trade_hishq GROUP BY code) m "
+            "ON h.code = m.code AND h.date = m.max_date"
+        )
+        df = pd.read_sql_query(sql, conn)
+    finally:
+        _return_db_conn(conn)
+
+    if df.empty:
+        return {}
+
+    spot = {}
+    for _, r in df.iterrows():
+        try:
+            spot[str(r['code'])] = {
+                '日期': str(r['date']),
+                '开盘': float(r['open']),
+                '收盘': float(r['close']),
+                '最高': float(r['high']),
+                '最低': float(r['low']),
+                '成交量': float(r['volume']),
+            }
+        except (ValueError, TypeError):
+            continue
+    return spot
+
+
 def fetch_spot_data():
-    """获取全市场盘中实时行情，返回 {code: {日期,开盘,收盘,最高,最低,成交量}}"""
+    """获取全市场行情数据：盘后从数据库读取，盘中走API"""
+    if _is_market_closed():
+        print("[INFO] 盘后模式：从数据库读取最新行情...")
+        spot = _fetch_spot_from_db()
+        if spot:
+            print(f"[OK] 数据库行情 {len(spot)} 只")
+            return spot
+        print("[WARN] 数据库无行情数据，回退到API...")
+
     today = datetime.now().strftime('%Y-%m-%d')
     spot = {}
 

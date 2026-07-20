@@ -65,14 +65,15 @@ def score(df, sector_avg_return=None, sector_up_ratio=None, sector_vol_trend=Non
         kdj_shielded = True
 
     # 板块强度仅用于调整追涨因子权重，不单独作为评分因子
-    # 主升=市场最强 → 适度放大；强势=本身强 → 适度放大；主升尾声 → 不放大；轮动 → 适度放大；弱势 → 大幅打折
+    # 主升=市场最强 → 适度放大；强势=本身强 → 适度放大；主升尾声 → 不放大；
+    # 涨后回落/弱势 → 大幅打折；轮动 → 适度放大
     if sector_level == 'main':
         momentum_factor = 1.2
     elif sector_level == 'strong':
         momentum_factor = 1.1
     elif sector_level == 'main_fading':
         momentum_factor = 1.0
-    elif sector_level == 'weak':
+    elif sector_level in ('weak', 'falling_back'):
         momentum_factor = 0.3
     else:
         momentum_factor = 1.2
@@ -145,8 +146,8 @@ def score(df, sector_avg_return=None, sector_up_ratio=None, sector_vol_trend=Non
                 all_details_extra = ['⚠偏离均线-1']
             else:
                 all_details_extra = []
-        elif sector_level == 'weak':
-            # 弱势板块：严格限制追高
+        elif sector_level in ('weak', 'falling_back'):
+            # 弱势/涨后回落：严格限制追高
             if deviation > 0.10:
                 total -= 2
                 all_details_extra = ['⚠弱势追高-2']
@@ -197,6 +198,8 @@ def score(df, sector_avg_return=None, sector_up_ratio=None, sector_vol_trend=Non
         all_details.append('📈强势板块:追涨×1.1')
     elif sector_level == 'main_fading':
         all_details.append('⚠主升尾声:追涨×1.0')
+    elif sector_level == 'falling_back':
+        all_details.append('🔻涨后回落:追涨×0.3')
     elif sector_level == 'weak':
         all_details.append('🔻弱势板块:追涨×0.3')
     if resonance_bonus:
