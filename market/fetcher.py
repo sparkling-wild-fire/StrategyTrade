@@ -85,21 +85,25 @@ def fetch_stock_list_sina():
 
 
 def get_stock_list():
-    """获取A股列表：优先从数据库trade_hishq读取，失败则走API"""
+    """获取A股列表：优先从stock_info表读取，失败则走API"""
     from config import STOCK_PREFIXES
     try:
         conn = _get_db_conn()
-        with conn.cursor() as cur:
-            cur.execute("SELECT DISTINCT code FROM trade_hishq")
-            codes = [r[0] for r in cur.fetchall()]
+        df = pd.read_sql_query(
+            "SELECT code AS 代码, name AS 名称 FROM stock_info", conn,
+        )
         _return_db_conn(conn)
-        # 筛选A股代码
-        filtered = [c for c in codes if c[:2] in STOCK_PREFIXES]
-        df = pd.DataFrame({'代码': filtered, '名称': filtered})
-        print(f"[OK] 从数据库获取 {len(df)} 只A股")
-        return df
+        if not df.empty:
+            print(f"[OK] 从stock_info表获取 {len(df)} 只A股")
+            return df
     except Exception as e:
-        print(f"[WARN] 数据库获取股票列表失败: {e}，回退到API...")
+        print(f"[WARN] stock_info表读取失败: {e}，回退到API...")
+
+    try:
+        print("[INFO] 从新浪财经获取股票列表...")
+        df = retry_with_backoff(fetch_stock_list_sina)
+        print(f"[OK] 成功获取 {len(df)} 只股票")
+        return df
 
     try:
         print("[INFO] 从新浪财经获取股票列表...")
